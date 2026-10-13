@@ -1,10 +1,9 @@
 # Android Kernel Mirror
-## Let me TEST it ...
 
 > An automated GitHub mirror of [Google Android Common Kernel (ACK)](https://android.googlesource.com/kernel/common).
 
 [![Sync Android Common Kernel](https://github.com/kquieter-debug/google-android-kernel-mirror/actions/workflows/sync-kernel.yml/badge.svg)](https://github.com/kquieter-debug/google-android-kernel-mirror/actions/workflows/sync-kernel.yml)
-![Last Sync](https://img.shields.io/github/last-commit/<OWNER>/<REPO>/main?label=last%20sync)
+![Last Sync](https://img.shields.io/github/last-commit/kquieter-debug/google-android-kernel-mirror/main?label=last%20sync)
 ![License](https://img.shields.io/badge/license-GPL--2.0-blue)
 
 ---
@@ -23,6 +22,20 @@ No modifications, patches, or downstream changes are applied. This is a read-onl
 
 > All source code is the property of Google LLC and the Linux Kernel community, licensed under **GPL-2.0**.
 > This repository only exists to provide convenient, automated access to the upstream source.
+
+---
+
+## IMPORTANT: Source-Only Snapshot
+
+This mirror provides **source code snapshots only** — it does **NOT** contain upstream commit history due to the limited push of github.
+
+- ✅ Full working tree of the tracked branch at the time of sync
+- ❌ No upstream commit history (`git log` will only show a single sync commit)
+- ❌ No upstream commit messages, authors, or timestamps
+- ❌ No upstream tags
+
+Each sync produces a **single squashed commit** representing the latest source state.
+If you need the full history, clone the [upstream ACK repo](https://android.googlesource.com/kernel/common) directly.
 
 ---
 
@@ -47,13 +60,28 @@ Branches are synced automatically every week. Only **NON-EOL-LTS** and **MAINLIN
 
 ---
 
-## Usage
+## How Synchronization Works
 
-### Clone (shallow — recommended)
+Syncing is handled by [GitHub Actions](.github/workflows/sync-kernel.yml).
 
-```bash
-# Default branch
-git clone --depth=1 https://github.com/kquieter-debug/google-android-kernel-mirror.git
+Each sync creates an **orphan branch containing a single commit** that holds the
+latest source tree. Upstream commit history is intentionally **not** preserved.
 
-# Specific branch
-git clone --depth=1 -b android14-6.1 https://github.com/kquieter-debug/google-android-kernel-mirror.git
+Strategy:
+  1. Shallow clone upstream (--depth=1) → source only
+  2. Orphan branch (single commit) → no history
+  3. pack.packSizeLimit=1g → bypass 2GB limit
+  4. Auto-retry + reduced pack size → network fault
+  5. Incremental batched push → last-resort path
+
+---
+
+## Use as a source tree ( NOT as a history source )
+### Since there is no commit history, use this mirror to:
+
+- Read / build the source at a given point in time
+- Diff against your own tree
+- Vendor into your project
+- Do not expect to git blame, git bisect, or git cherry-pick upstream commits from this mirror.
+
+---
