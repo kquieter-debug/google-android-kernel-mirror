@@ -189,13 +189,14 @@ jobs:
           while [ ${RETRY} -lt ${MAX_RETRY} ]; do
             echo "=== 推送尝试 $((RETRY+1))/${MAX_RETRY} ==="
 
-            if git push origin "refs/heads/${LOCAL_REF}:refs/heads/${TARGET_BRANCH}" \
-                 --force \
-                 --verbose \
+            if git \
                  -c http.postBuffer=524288000 \
                  -c pack.packSizeLimit=1g \
                  -c pack.windowMemory=256m \
-                 -c pack.threads=1; then
+                 -c pack.threads=1 \
+                 push origin "refs/heads/${LOCAL_REF}:refs/heads/${TARGET_BRANCH}" \
+                 --force \
+                 --verbose; then
               echo "✅ 推送成功"
               exit 0
             fi
