@@ -1,0 +1,227 @@
+name: Sync Android Common Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '要同步的内核分支'
+        required: true
+        default: 'android-mainline'
+        type: choice
+        options:
+          - android-mainline
+          - android17-6.18-lts
+          - android16-6.12-lts
+          - android15-6.6-lts
+          - android14-6.1-lts
+          - android14-5.15-lts
+          - android13-5.15-lts
+          - android13-5.10-lts
+          - android12-5.10-lts
+      depth:
+        description: '浅克隆深度（0 表示完整历史，推荐 1）'
+        required: true
+        default: '1'
+      push_mode:
+        description: '推送模式（single 只推最新快照，推荐；force 覆盖同名分支）'
+        required: true
+        default: 'single'
+        type: choice
+        options:
+          - single
+          - force
+  schedule:
+    - cron: '0 0 * * 0'
+
+concurrency:
+  group: kernel-sync-${{ github.event.inputs.kernel_branch || 'android-mainline' }}
+  cancel-in-progress: false
+
+jobs:
+  sync-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          echo "=== 清理前 ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== 清理后 ==="
+          df -h
+
+      - name: 检出当前仓库（main，用于读取 README/LICENSE）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git（放宽限制 + 提升稳定性）
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git config --global http.postBuffer 524288000        # 500MB 缓冲
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global core.compression 1               # 轻微压缩，兼顾 CPU 与体积
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 1g            # 单 pack 限制 1GB
+          git config --global pack.threads 1
+
+      - name: 设置变量
+        id: vars
+        run: |
+          KERNEL_BRANCH="${{ github.event.inputs.kernel_branch || 'android-mainline' }}"
+          DEPTH="${{ github.event.inputs.depth || '1' }}"
+          PUSH_MODE="${{ github.event.inputs.push_mode || 'single' }}"
+
+          # 目标分支 = 内核分支名（同名）
+          TARGET_BRANCH="${KERNEL_BRANCH}"
+
+          # 保护 main：不允许同步到 main
+          if [ "${TARGET_BRANCH}" = "main" ]; then
+            echo "❌ 不允许同步到 main 分支（main 保留 README/LICENSE）"
+            exit 1
+          fi
+
+          if [ "${PUSH_MODE}" = "force" ] && [ "${DEPTH}" != "0" ]; then
+            echo "⚠️ force 模式建议 depth=0；当前 depth=${DEPTH}，仅会推最近 ${DEPTH} 个提交"
+          fi
+
+          echo "kernel_branch=${KERNEL_BRANCH}" >> $GITHUB_OUTPUT
+          echo "target_branch=${TARGET_BRANCH}" >> $GITHUB_OUTPUT
+          echo "depth=${DEPTH}" >> $GITHUB_OUTPUT
+          echo "push_mode=${PUSH_MODE}" >> $GITHUB_OUTPUT
+          echo "同步: 内核 ${KERNEL_BRANCH} -> 本仓库 ${TARGET_BRANCH} (depth=${DEPTH}, mode=${PUSH_MODE})"
+
+      - name: 添加 Google 内核远程仓库
+        run: |
+          git remote add kernel https://android.googlesource.com/kernel/common
+          git remote -v
+
+      - name: 拉取内核源码
+        run: |
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          DEPTH="${{ steps.vars.outputs.depth }}"
+
+          if [ "${DEPTH}" = "0" ]; then
+            echo "完整拉取 ${KERNEL_BRANCH}（可能很慢）..."
+            git fetch kernel "${KERNEL_BRANCH}" --no-tags --progress
+          else
+            echo "浅拉取 ${KERNEL_BRANCH} depth=${DEPTH} ..."
+            git fetch kernel "${KERNEL_BRANCH}" --depth="${DEPTH}" --no-tags --progress
+          fi
+
+          # 用 remote-tracking ref，避免 FETCH_HEAD 歧义
+          git checkout -B "${KERNEL_BRANCH}" "kernel/${KERNEL_BRANCH}"
+          echo "当前提交: $(git log -1 --oneline)"
+          df -h
+
+      - name: 准备目标分支（orphan 快照，保留 main 的 README/LICENSE）
+        run: |
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          PUSH_MODE="${{ steps.vars.outputs.push_mode }}"
+
+          # 设置带 token 的 origin
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          if [ "${PUSH_MODE}" = "single" ]; then
+            echo "模式 single：创建 orphan 分支，只保留最新快照"
+
+            # 先切到有文件的内核提交，再建 orphan
+            git checkout "${KERNEL_BRANCH}"
+
+            # 删除旧的同名 orphan 分支（如果存在）
+            git branch -D "sync-${TARGET_BRANCH}" 2>/dev/null || true
+
+            git checkout --orphan "sync-${TARGET_BRANCH}"
+
+            # 把内核源码全部加入暂存
+            git add -A
+
+            # 从 main 取回你自己的 README/LICENSE，覆盖内核自带的同名文件
+            # 说明：内核自带 README、COPYING、LICENSE（部分版本）等，
+            #       这里用你 main 里的版本覆盖，确保目标分支里是你的文件。
+            for f in README.md README LICENSE LICENSE.md COPYING; do
+              if git cat-file -e "main:${f}" 2>/dev/null; then
+                echo "从 main 取回 ${f}"
+                git show "main:${f}" > "${f}"
+                git add "${f}"
+              fi
+            done
+
+            git commit -m "Sync ${KERNEL_BRANCH} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+
+            echo "orphan 分支已创建，文件数: $(git ls-files | wc -l)"
+            echo "快照大小: $(du -sh .git 2>/dev/null | cut -f1)"
+          else
+            echo "模式 ${PUSH_MODE}：使用源分支历史（不会保留你的 README/LICENSE）"
+            git checkout "${KERNEL_BRANCH}"
+          fi
+
+      - name: 推送到同名分支（带重试）
+        id: push
+        run: |
+          set -e
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          PUSH_MODE="${{ steps.vars.outputs.push_mode }}"
+          MAX_RETRY=5
+          RETRY=0
+
+          if [ "${PUSH_MODE}" = "single" ]; then
+            LOCAL_REF="sync-${TARGET_BRANCH}"
+          else
+            LOCAL_REF="${TARGET_BRANCH}"
+          fi
+
+          echo "推送 ${LOCAL_REF} -> origin/${TARGET_BRANCH}"
+
+          while [ ${RETRY} -lt ${MAX_RETRY} ]; do
+            echo "=== 推送尝试 $((RETRY+1))/${MAX_RETRY} ==="
+
+            if git push origin "refs/heads/${LOCAL_REF}:refs/heads/${TARGET_BRANCH}" \
+                 --force \
+                 --verbose \
+                 -c http.postBuffer=524288000 \
+                 -c pack.packSizeLimit=1g \
+                 -c pack.windowMemory=256m \
+                 -c pack.threads=1; then
+              echo "✅ 推送成功"
+              exit 0
+            fi
+
+            RETRY=$((RETRY+1))
+            echo "⚠️ 第 ${RETRY} 次失败，等待 $((RETRY*15)) 秒后重试..."
+            sleep $((RETRY*15))
+
+            # 失败后缩小 pack 尺寸再试
+            git config pack.packSizeLimit 500m
+          done
+
+          echo "❌ 重试 ${MAX_RETRY} 次后仍失败"
+          exit 1
+
+      - name: 输出同步摘要
+        if: always()
+        run: |
+          echo "## 内核同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 内核分支 | \`${{ steps.vars.outputs.kernel_branch || 'android-mainline' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 目标分支 | \`${{ steps.vars.outputs.target_branch || 'android-mainline' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 拉取深度 | \`${{ steps.vars.outputs.depth || '1' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 推送模式 | \`${{ steps.vars.outputs.push_mode || 'single' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 状态 | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> main 分支保留你的 README/LICENSE，不会被覆盖。" >> $GITHUB_STEP_SUMMARY
