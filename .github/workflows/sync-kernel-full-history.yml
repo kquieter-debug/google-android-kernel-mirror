@@ -1,0 +1,331 @@
+name: Sync Android Common Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '要同步的内核分支'
+        required: true
+        default: 'android-mainline'
+        type: choice
+        options:
+          - android-mainline
+          - android17-6.18-lts
+          - android16-6.12-lts
+          - android15-6.6-lts
+          - android14-6.1-lts
+          - android14-5.15-lts
+          - android13-5.15-lts
+          - android13-5.10-lts
+          - android12-5.10-lts
+      target_branch:
+        description: '推送到本仓库的目标分支名（留空则同名）'
+        required: false
+        default: ''
+      mode:
+        description: '同步模式'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto        # 自动判断：目标分支不存在→全量；存在→增量
+          - full        # 强制全量重建
+          - incremental # 强制增量（目标分支不存在会报错）
+      keep_readme:
+        description: '保留 main 的 README/LICENSE（覆盖内核自带同名文件）'
+        required: true
+        default: 'true'
+        type: boolean
+  schedule:
+    - cron: '0 0 * * 0'
+
+concurrency:
+  group: kernel-sync-${{ github.event.inputs.kernel_branch || 'android-mainline' }}
+  cancel-in-progress: false
+
+jobs:
+  sync-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          echo "=== 清理前 ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== 清理后 ==="
+          df -h
+
+      - name: 检出当前仓库（main，用于读取 README/LICENSE）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 大 push 稳定性
+          git config --global http.postBuffer 1048576000       # 1GB
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global core.compression 1
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 1g
+          git config --global pack.threads 1
+          git config --global gc.auto 0                         # 禁用自动 gc，避免中途卡顿
+
+      - name: 设置变量
+        id: vars
+        run: |
+          KERNEL_BRANCH="${{ github.event.inputs.kernel_branch || 'android-mainline' }}"
+
+          # 目标分支：用户指定，或默认同名
+          USER_TARGET="${{ github.event.inputs.target_branch }}"
+          if [ -z "${USER_TARGET}" ]; then
+            TARGET_BRANCH="${KERNEL_BRANCH}"
+          else
+            TARGET_BRANCH="${USER_TARGET}"
+          fi
+
+          MODE="${{ github.event.inputs.mode || 'auto' }}"
+          KEEP_README="${{ github.event.inputs.keep_readme || 'true' }}"
+
+          # 保护 main
+          if [ "${TARGET_BRANCH}" = "main" ]; then
+            echo "❌ 不允许同步到 main 分支"
+            exit 1
+          fi
+
+          echo "kernel_branch=${KERNEL_BRANCH}" >> $GITHUB_OUTPUT
+          echo "target_branch=${TARGET_BRANCH}" >> $GITHUB_OUTPUT
+          echo "mode=${MODE}" >> $GITHUB_OUTPUT
+          echo "keep_readme=${KEEP_README}" >> $GITHUB_OUTPUT
+          echo "同步: 内核 ${KERNEL_BRANCH} -> 本仓库 ${TARGET_BRANCH} (mode=${MODE})"
+
+      - name: 添加 Google 内核远程仓库
+        run: |
+          git remote add kernel https://android.googlesource.com/kernel/common
+          git remote -v
+
+      - name: 探测目标分支是否存在 & 决定同步模式
+        id: detect
+        run: |
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          MODE="${{ steps.vars.outputs.mode }}"
+
+          # origin 带 token
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          set +e
+          git ls-remote --exit-code --heads origin "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1
+          EXISTS=$?
+          set -e
+
+          if [ "${EXISTS}" -eq 0 ]; then
+            echo "目标分支 origin/${TARGET_BRANCH} 已存在"
+            REMOTE_EXISTS=true
+          else
+            echo "目标分支 origin/${TARGET_BRANCH} 不存在"
+            REMOTE_EXISTS=false
+          fi
+
+          # auto 决策
+          if [ "${MODE}" = "auto" ]; then
+            if [ "${REMOTE_EXISTS}" = "true" ]; then
+              MODE="incremental"
+            else
+              MODE="full"
+            fi
+          fi
+
+          # 强制校验
+          if [ "${MODE}" = "incremental" ] && [ "${REMOTE_EXISTS}" != "true" ]; then
+            echo "❌ incremental 模式但目标分支不存在，请改用 full/auto"
+            exit 1
+          fi
+
+          echo "实际使用模式: ${MODE}"
+          echo "remote_exists=${REMOTE_EXISTS}" >> $GITHUB_OUTPUT
+          echo "actual_mode=${MODE}" >> $GITHUB_OUTPUT
+
+      - name: 拉取上游（全量或增量）
+        id: fetch
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          ACTUAL_MODE="${{ steps.detect.outputs.actual_mode }}"
+
+          if [ "${ACTUAL_MODE}" = "full" ]; then
+            echo "=== 全量拉取 ${KERNEL_BRANCH} ==="
+            git fetch kernel "${KERNEL_BRANCH}" --no-tags --progress
+            git checkout -B "mirror-${TARGET_BRANCH}" "kernel/${KERNEL_BRANCH}"
+          else
+            echo "=== 增量拉取 ${KERNEL_BRANCH} ==="
+            # 先在本地建立目标分支的 tracking 引用
+            git fetch origin "refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" --no-tags
+
+            # 用 shallow 的方式逐步加深：先只取一个已知点附近的提交
+            # 若本地已有完整历史（前一次 full/incremental 已 fetch），这次只是 fast-forward
+            echo "先从 origin 拿到目标分支最新已知提交..."
+            BASE_SHA=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+
+            # 直接 fetch 上游完整历史（git 会复用已有对象，只下载缺失部分）
+            git fetch kernel "${KERNEL_BRANCH}" --no-tags --progress
+
+            git checkout -B "mirror-${TARGET_BRANCH}" "kernel/${KERNEL_BRANCH}"
+
+            # 输出本次新增了多少
+            if git merge-base --is-ancestor "${BASE_SHA}" HEAD 2>/dev/null; then
+              NEW_COMMITS=$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null || echo "?")
+              echo "本次新增提交数: ${NEW_COMMITS}"
+              echo "new_commits=${NEW_COMMITS}" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ 目标分支与上游无共同祖先（可能之前是 orphan 快照），需要 full 重建"
+              echo "new_commits=unknown" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          echo "当前 HEAD: $(git log -1 --oneline)"
+          df -h
+
+      - name: 覆盖 README/LICENSE（可选）
+        if: steps.vars.outputs.keep_readme == 'true'
+        run: |
+          set -e
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+
+          CHANGED=0
+          for f in README.md README LICENSE LICENSE.md COPYING; do
+            if git cat-file -e "main:${f}" 2>/dev/null; then
+              # 取 main 里的内容
+              git show "main:${f}" > /tmp/main_file
+              # 与当前工作树比较
+              if [ -f "${f}" ]; then
+                if ! cmp -s /tmp/main_file "${f}"; then
+                  cp /tmp/main_file "${f}"
+                  git add "${f}"
+                  CHANGED=1
+                  echo "覆盖 ${f}"
+                else
+                  echo "${f} 已一致，跳过"
+                fi
+              else
+                cp /tmp/main_file "${f}"
+                git add "${f}"
+                CHANGED=1
+                echo "新增 ${f}"
+              fi
+            fi
+          done
+
+          if [ "${CHANGED}" = "1" ]; then
+            git commit -m "chore: sync README/LICENSE from main [skip ci]"
+            echo "已在镜像分支顶部追加 README/LICENSE 覆盖提交"
+          else
+            echo "README/LICENSE 无需变更"
+          fi
+
+          echo "最终 HEAD: $(git log -1 --oneline)"
+
+      - name: 推送到目标分支（增量或分批）
+        id: push
+        run: |
+          set -e
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          ACTUAL_MODE="${{ steps.detect.outputs.actual_mode }}"
+          LOCAL_REF="mirror-${TARGET_BRANCH}"
+          MAX_RETRY=5
+
+          echo "推送 ${LOCAL_REF} -> origin/${TARGET_BRANCH} (mode=${ACTUAL_MODE})"
+
+          # 如果之前是 orphan 快照，且我们做增量，需要 --force 或处理无共同祖先
+          PUSH_FLAGS="--verbose"
+          if [ "${ACTUAL_MODE}" = "full" ]; then
+            PUSH_FLAGS="${PUSH_FLAGS} --force"
+          fi
+
+          RETRY=0
+          while [ ${RETRY} -lt ${MAX_RETRY} ]; do
+            echo "=== 推送尝试 $((RETRY+1))/${MAX_RETRY} ==="
+            if git \
+                 -c http.postBuffer=1048576000 \
+                 -c pack.packSizeLimit=1g \
+                 -c pack.windowMemory=256m \
+                 -c pack.threads=1 \
+                 push origin "refs/heads/${LOCAL_REF}:refs/heads/${TARGET_BRANCH}" \
+                 ${PUSH_FLAGS}; then
+              echo "✅ 推送成功"
+              exit 0
+            fi
+
+            RETRY=$((RETRY+1))
+            WAIT=$((RETRY*15))
+            echo "⚠️ 第 ${RETRY} 次失败，等待 ${WAIT}s 后重试..."
+            sleep ${WAIT}
+
+            # 逐步缩小 pack，降低单次请求体积
+            git config pack.packSizeLimit 500m
+          done
+
+          echo "❌ 单次推送失败，尝试分批推送（按提交批次）"
+          # 兜底：按 200 commit 一批推送
+          BATCH_SIZE=200
+          TARGET_SHA=$(git rev-parse "${LOCAL_REF}")
+          FIRST_SHA=$(git rev-list --max-parents=0 "${LOCAL_REF}" | head -1)
+
+          # 找出 origin 上已有的提交（若有），从它的下一个开始推
+          if git rev-parse "refs/remotes/origin/${TARGET_BRANCH}" >/dev/null 2>&1; then
+            START_AFTER=$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")
+            echo "从 ${START_AFTER} 之后开始分批推送"
+          else
+            START_AFTER=""
+          fi
+
+          # 构造待推送 commit 列表
+          if [ -z "${START_AFTER}" ]; then
+            COMMITS=$(git rev-list --reverse "${LOCAL_REF}")
+          else
+            COMMITS=$(git rev-list --reverse "${START_AFTER}..${LOCAL_REF}")
+          fi
+
+          echo "${COMMITS}" | awk -v bs="${BATCH_SIZE}" 'NR % bs == 0 {print} END {print}' | while read -r commit; do
+            [ -z "${commit}" ] && continue
+            echo "推送至提交: $(git log -1 --oneline ${commit})"
+            for r in 1 2 3; do
+              if git push origin "${commit}:refs/heads/${TARGET_BRANCH}" --force; then
+                break
+              fi
+              echo "批次重试 ${r}..."
+              sleep $((r*20))
+            done
+          done
+
+          # 最终推一次 HEAD，确保 ref 对齐
+          git push origin "refs/heads/${LOCAL_REF}:refs/heads/${TARGET_BRANCH}" --force
+
+      - name: 输出同步摘要
+        if: always()
+        run: |
+          echo "## 内核同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 内核分支 | \`${{ steps.vars.outputs.kernel_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 目标分支 | \`${{ steps.vars.outputs.target_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 同步模式 | \`${{ steps.detect.outputs.actual_mode }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 本次新增提交 | \`${{ steps.fetch.outputs.new_commits || 'N/A' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 状态 | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 完整历史已保留；main 分支保留你的 README/LICENSE。" >> $GITHUB_STEP_SUMMARY

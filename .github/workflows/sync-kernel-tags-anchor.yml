@@ -1,0 +1,343 @@
+name: Sync Android Common Kernel (Tag Anchor)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '要同步的内核分支'
+        required: true
+        default: 'android14-6.1-lts'
+        type: choice
+        options:
+          - android-mainline
+          - android17-6.18-lts
+          - android16-6.12-lts
+          - android15-6.6-lts
+          - android14-6.1-lts
+          - android14-5.15-lts
+          - android13-5.15-lts
+          - android13-5.10-lts
+          - android12-5.10-lts
+      target_branch:
+        description: '本仓库目标分支名（留空则同名）'
+        required: false
+        default: ''
+      tag_limit:
+        description: '限制使用多少个 tag 作为锚点（0 表示全部，调试用可设 3）'
+        required: true
+        default: '0'
+      keep_readme:
+        description: '保留 main 的 README/LICENSE'
+        required: true
+        default: 'true'
+        type: boolean
+      start_from_latest_tag:
+        description: '若为 true，只从最近一个 tag 开始同步（适合已有较新镜像，仅补增量）'
+        required: true
+        default: 'false'
+        type: boolean
+  schedule:
+    - cron: '0 2 * * 0'
+
+concurrency:
+  group: kernel-sync-tag-${{ github.event.inputs.kernel_branch || 'android14-6.1-lts' }}
+  cancel-in-progress: false
+
+jobs:
+  sync-kernel-tag-anchor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          echo "=== 清理前 ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== 清理后 ==="
+          df -h
+
+      - name: 检出当前仓库（main）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 提高单次 push 稳定性
+          git config --global http.postBuffer 1048576000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global core.compression 1
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 1g
+          git config --global pack.threads 1
+          git config --global gc.auto 0
+
+      - name: 设置变量
+        id: vars
+        run: |
+          KERNEL_BRANCH="${{ github.event.inputs.kernel_branch || 'android14-6.1-lts' }}"
+
+          USER_TARGET="${{ github.event.inputs.target_branch }}"
+          if [ -z "${USER_TARGET}" ]; then
+            TARGET_BRANCH="${KERNEL_BRANCH}"
+          else
+            TARGET_BRANCH="${USER_TARGET}"
+          fi
+
+          TAG_LIMIT="${{ github.event.inputs.tag_limit || '0' }}"
+          KEEP_README="${{ github.event.inputs.keep_readme || 'true' }}"
+          START_LATEST="${{ github.event.inputs.start_from_latest_tag || 'false' }}"
+
+          if [ "${TARGET_BRANCH}" = "main" ]; then
+            echo "❌ 不允许同步到 main"
+            exit 1
+          fi
+
+          echo "kernel_branch=${KERNEL_BRANCH}" >> $GITHUB_OUTPUT
+          echo "target_branch=${TARGET_BRANCH}" >> $GITHUB_OUTPUT
+          echo "tag_limit=${TAG_LIMIT}" >> $GITHUB_OUTPUT
+          echo "keep_readme=${KEEP_README}" >> $GITHUB_OUTPUT
+          echo "start_from_latest_tag=${START_LATEST}" >> $GITHUB_OUTPUT
+          echo "同步: ${KERNEL_BRANCH} -> ${TARGET_BRANCH} (tag_limit=${TAG_LIMIT}, start_latest=${START_LATEST})"
+
+      - name: 添加 Google 内核远程仓库
+        run: |
+          git remote add kernel https://android.googlesource.com/kernel/common
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git remote -v
+
+      - name: 拉取上游分支 + 所有 tags
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+
+          echo "=== 拉取分支 ${KERNEL_BRANCH} 与全部 tags ==="
+          # --tags 会同时拉取 tag 指向的对象；分支使用 --no-tags 避免重复
+          git fetch kernel "${KERNEL_BRANCH}" --tags --progress
+
+          # 建立本地镜像分支
+          git checkout -B "mirror-${KERNEL_BRANCH}" "kernel/${KERNEL_BRANCH}"
+
+          echo "HEAD: $(git log -1 --oneline)"
+          echo "上游 tags 总数: $(git tag | wc -l)"
+          df -h
+
+      - name: 计算 tag 锚点列表
+        id: tags
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TAG_LIMIT="${{ steps.vars.outputs.tag_limit }}"
+          START_LATEST="${{ steps.vars.outputs.start_from_latest_tag }}"
+
+          # 只取与当前分支相关的 tag（即 tag 指向的 commit 是 HEAD 的祖先）
+          # 这一步很关键：kernel/common 有大量 tag 属于其他分支，
+          # 直接全用会导致推送无关对象。
+          echo "筛选属于 ${KERNEL_BRANCH} 的 ancestors tags ..."
+
+          # 取所有 tag → 只要 tag 的对象是 HEAD 的祖先
+          git tag --merged "mirror-${KERNEL_BRANCH}" > /tmp/all_tags.txt || true
+          echo "与分支相关的 tags 数量: $(wc -l < /tmp/all_tags.txt)"
+
+          # 按 tag 指向的 commit 时间升序排列
+          > /tmp/anchors.txt
+          while read -r t; do
+            [ -z "$t" ] && continue
+            # 跳过非 commit 类型（annotated tag 需 dereference）
+            COMMIT=$(git rev-list -n1 "$t" 2>/dev/null || true)
+            [ -z "$COMMIT" ] && continue
+            TS=$(git log -1 --format=%ct "$COMMIT")
+            echo "${TS} ${t} ${COMMIT}" >> /tmp/anchors.txt
+          done < /tmp/all_tags.txt
+
+          sort -n /tmp/anchors.txt -o /tmp/anchors_sorted.txt
+          echo "排序后锚点数量: $(wc -l < /tmp/anchors_sorted.txt)"
+
+          # 只取 tag 名 + commit 两列
+          awk '{print $2" "$3}' /tmp/anchors_sorted.txt > /tmp/anchors_clean.txt
+
+          # start_from_latest_tag=true：只保留最后一个锚点
+          if [ "${START_LATEST}" = "true" ]; then
+            tail -n 1 /tmp/anchors_clean.txt > /tmp/anchors_final.txt
+          else
+            cp /tmp/anchors_clean.txt /tmp/anchors_final.txt
+          fi
+
+          # tag_limit > 0：只取最后 N 个（即最近 N 个）
+          if [ "${TAG_LIMIT}" != "0" ]; then
+            tail -n "${TAG_LIMIT}" /tmp/anchors_final.txt > /tmp/anchors_limited.txt
+            mv /tmp/anchors_limited.txt /tmp/anchors_final.txt
+          fi
+
+          echo "=== 最终使用锚点（旧 → 新）==="
+          cat /tmp/anchors_final.txt
+          echo "锚点数量: $(wc -l < /tmp/anchors_final.txt)"
+          echo "anchors_count=$(wc -l < /tmp/anchors_final.txt)" >> $GITHUB_OUTPUT
+
+      - name: 分批推送 tag 锚点
+        id: push_batches
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+          START_LATEST="${{ steps.vars.outputs.start_from_latest_tag }}"
+
+          # 目标分支在 origin 当前指向的 commit（若不存在则空）
+          set +e
+          BASE_SHA=$(git ls-remote --heads origin "refs/heads/${TARGET_BRANCH}" | awk '{print $1}')
+          set -e
+          if [ -z "${BASE_SHA}" ]; then
+            echo "origin/${TARGET_BRANCH} 不存在，将从头开始"
+            BASE_SHA=""
+          else
+            echo "origin/${TARGET_BRANCH} 当前指向: ${BASE_SHA}"
+          fi
+
+          IDX=0
+          TOTAL=$(wc -l < /tmp/anchors_final.txt)
+
+          while read -r TAG_NAME COMMIT_SHA; do
+            [ -z "${TAG_NAME}" ] && continue
+            IDX=$((IDX+1))
+            echo ""
+            echo "================================================"
+            echo "[${IDX}/${TOTAL}] 锚点 tag=${TAG_NAME} commit=${COMMIT_SHA}"
+            echo "================================================"
+
+            # 如果这个 commit 已经是 origin 目标分支的祖先，跳过
+            if [ -n "${BASE_SHA}" ]; then
+              if git merge-base --is-ancestor "${COMMIT_SHA}" "${BASE_SHA}" 2>/dev/null; then
+                echo "该锚点已在 origin/${TARGET_BRANCH} 历史中，跳过"
+                continue
+              fi
+            fi
+
+            # 推送策略：把该锚点的 commit 直接推到目标分支
+            # 由于是纯 fast-forward（在时间顺序上递进），用 force 也可以
+            # 但用普通推送更安全；如果前面跳过某些 tag 导致不连续，则用 --force
+            MAX_RETRY=5
+            RETRY=0
+            SUCCESS=0
+            while [ ${RETRY} -lt ${MAX_RETRY} ]; do
+              echo "推送尝试 $((RETRY+1))/${MAX_RETRY}"
+              if git \
+                   -c http.postBuffer=1048576000 \
+                   -c pack.packSizeLimit=1g \
+                   -c pack.windowMemory=256m \
+                   -c pack.threads=1 \
+                   push origin "${COMMIT_SHA}:refs/heads/${TARGET_BRANCH}" \
+                   --force --verbose; then
+                SUCCESS=1
+                echo "✅ 锚点 ${TAG_NAME} 推送成功"
+                break
+              fi
+              RETRY=$((RETRY+1))
+              WAIT=$((RETRY*15))
+              echo "⚠️ 失败，等待 ${WAIT}s 后重试"
+              sleep ${WAIT}
+              git config pack.packSizeLimit 500m
+            done
+
+            if [ "${SUCCESS}" != "1" ]; then
+              echo "❌ 锚点 ${TAG_NAME} (${COMMIT_SHA}) 推送失败，中止"
+              exit 1
+            fi
+          done < /tmp/anchors_final.txt
+
+          echo "=== 所有锚点推送完成 ==="
+
+      - name: 覆盖 README/LICENSE（可选）
+        if: steps.vars.outputs.keep_readme == 'true'
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+
+          # 在本地 mirror 分支上追加 README 覆盖提交
+          git checkout "mirror-${KERNEL_BRANCH}"
+
+          CHANGED=0
+          for f in README.md README LICENSE LICENSE.md COPYING; do
+            if git cat-file -e "main:${f}" 2>/dev/null; then
+              git show "main:${f}" > /tmp/main_file
+              if [ -f "${f}" ]; then
+                if ! cmp -s /tmp/main_file "${f}"; then
+                  cp /tmp/main_file "${f}"
+                  git add "${f}"
+                  CHANGED=1
+                  echo "覆盖 ${f}"
+                fi
+              else
+                cp /tmp/main_file "${f}"
+                git add "${f}"
+                CHANGED=1
+                echo "新增 ${f}"
+              fi
+            fi
+          done
+
+          if [ "${CHANGED}" = "1" ]; then
+            git commit -m "chore: sync README/LICENSE from main [skip ci]"
+            echo "README/LICENSE 覆盖提交已创建"
+          else
+            echo "README/LICENSE 无需变更"
+          fi
+
+      - name: 推送最终 HEAD（对齐分支 tip）
+        run: |
+          set -e
+          KERNEL_BRANCH="${{ steps.vars.outputs.kernel_branch }}"
+          TARGET_BRANCH="${{ steps.vars.outputs.target_branch }}"
+
+          echo "推送 mirror-${KERNEL_BRANCH} -> origin/${TARGET_BRANCH}"
+          MAX_RETRY=5
+          RETRY=0
+          while [ ${RETRY} -lt ${MAX_RETRY} ]; do
+            echo "最终推送尝试 $((RETRY+1))/${MAX_RETRY}"
+            if git \
+                 -c http.postBuffer=1048576000 \
+                 -c pack.packSizeLimit=1g \
+                 -c pack.windowMemory=256m \
+                 -c pack.threads=1 \
+                 push origin "refs/heads/mirror-${KERNEL_BRANCH}:refs/heads/${TARGET_BRANCH}" \
+                 --force --verbose; then
+              echo "✅ 最终 HEAD 推送成功"
+              exit 0
+            fi
+            RETRY=$((RETRY+1))
+            sleep $((RETRY*20))
+          done
+
+          echo "⚠️ 最终 HEAD 推送失败，但历史锚点已推送。"
+          echo "   目标分支至少已包含到最后一个成功锚点。"
+          echo "   下次运行会从该锚点继续增量。"
+          # 不 exit 1，避免因为最后一步把前面的成果判为失败
+
+      - name: 输出同步摘要
+        if: always()
+        run: |
+          echo "## 内核同步结果（Tag 锚点模式）" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 内核分支 | \`${{ steps.vars.outputs.kernel_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 目标分支 | \`${{ steps.vars.outputs.target_branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 锚点数量 | \`${{ steps.tags.outputs.anchors_count }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| tag_limit | \`${{ steps.vars.outputs.tag_limit }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| start_from_latest_tag | \`${{ steps.vars.outputs.start_from_latest_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 状态 | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 每个锚点 tag 单独推送，单次体积远小于 2GB。" >> $GITHUB_STEP_SUMMARY
