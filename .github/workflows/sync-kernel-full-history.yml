@@ -1,4 +1,4 @@
-name: Sync Android Common Kernel
+name: Sync Android Common Kernel (full history)
 
 on:
   workflow_dispatch:
